@@ -192,10 +192,29 @@ syscall forward 机制主要包括 axprocess 下的 `scf` 模块、共享内存�
 
 #### 共享内存
 
+共享内存主要负责 Linux 与 axprocess 之间的系统调用传递，由于 arceos-hv 负责整个硬件平台的物理内存资源管理，可以划分出一块物理内存，通过 EPT 映射给 用户虚拟机（Linux），axprocess 可以直接通过一一映射的虚拟地址空间访问这段地址空间，实现内存共享。arceos的scf机制需要基于这段共享内存空间设计合适的消息传递与同步机制，完成系统调用请求的传递。
+
+目前，arceos-hv 借鉴了 [rvm-rtos](https://github.com/rvm-rtos/) 中的共享内存队列，主要实现了 `SyscallQueueBuffer` 与 `SyscallDataBuffer`， 二者被放置于 arceos 物理内存的最后一段，具体的物理地址配置信息在 `axconfig` 模块中给出。
+
+`SyscallDataBuffer`是 arceos-hv 项目中的一个临时实现，在传递一个 syscall 请求时，以 write 系统调用为例，对于用户态指针（如 write 调用的第二个参数存储期望写入的数据指针，第三个参数存放数据长度），需要从 `SyscallDataBuffer` 中申请一个对应大小的共享内存区域，再将具体数据从用户态地址拷贝到 `SyscallDataBuffer` 的这段共享内存区域暂存，再将具体数据在 `SyscallDataBuffer` 中的偏移作为第二个参数封装成 syscall req 通过 `SyscallQueueBuffer` 发送给 Linux，Linux 用户态守护进程从 `SyscallQueueBuffer` 中解析出待处理的 syscall req 后，会根据偏移从 `SyscallDataBuffer` 中将待写入的数据取出，通过 Linux 的 write 系统调用写到目标文件描述符（fd）中。
+
+这种实现多了一次不必要的数据搬运，从而在一定程度上增加了 scf 的开销。
+
+后续工作中，arceos-hv 的 scf 模块将采用类似 cRTOS 的方法，为 axprocess 与 Linux 的用户守护进程建立“镜像地址空间”，确保axprocess的物理内存与 Linux 的用户守护进程的虚拟地址空间视角一致，并被映射到同一段物理内存，从而移除 `SyscallDataBuffer` 的数据暂存步骤，Linux 的用户守护进程可以直接通过 axprocess 传递过来的用户态指针来读取数据，减少拷贝开销。
 
 
-#### Linux 下的可加载内核模块与用户态守护进程
+#### Linux 下的内核态驱动与用户态守护进程
+
+arceos-hv 中 axprocess 的系统调用转发需要 Linux 内部的内核态驱动与用户态守护进程的共同支持，二者主要参考 [nimbos-driver](https://github.com/rvm-rtos/nimbos-driver) 实现。
+
+内核态驱动主要负责为用户提供一个虚拟设备（`/dev/arceos vdev`），并实现设备相关方法（`mmap`等），为用户态守护进程建立用户虚拟地址空间到对应的共享内存空间（以一个设备内存的形式提供给Linux）的映射。同时，内核态驱动需要注册相关的中断处理函数，用于接收来自其他核心的IPI（告知有一个新的 syscall req），并通过 signal 机制告知用户态守护进程。
+
+用户态守护进程需要 open 内核态驱动提供的虚拟设备，通过 `mmap` 方法主动建立相关的内存映射，并注册一个 `singal_handler`, 接收来自内核态驱动的 singal 主动从 `SyscallQueueBuffer` 中 poll 一个 sycall req 并通过 Linux 下的系统调用完成 syscall 处理，再将结果通过 `SyscallQueueBuffer` 写回。
 
 
+## 下一步工作计划
 
-## 改进与展望
+* 优化 & 重构当前代码
+* 完善 axtask 对属于 axvm 的 vcpu 资源的统一管理，重新设计对 vcpu 资源的抽象（复用 hypercraft & port hypercraft）
+* 为 axprocess 与 Linux 的用户守护进程建立“镜像地址空间”，减少 syscall forward 过程中的数据拷贝
+* 为 axprocess 支持更多的 syscall 转发，支持复杂应用
