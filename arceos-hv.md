@@ -136,11 +136,12 @@ pub enum TaskType {
 
 * `TaskType::Vcpu` 表示该 task 上承载的是一个客户虚拟机，此时 task 相当于这个客户虚拟机的 vcpu 线程，存储客户虚拟机 vcpu 的相关资源（目前由 hypercraft 支持），通过虚拟化拓展指令 `vmlaunch` 进入 non-root 模式下硬件支持的虚拟化环境中运行。
 
-基本设计思路如图所示：
+基本设计思路如图所示，在`task_entry` 函数根据不同的 `TaskType` 通过不同的 “ret” 方式进入不同的执行环境：
 
-![Arceos-HV axtask 统一管理](imgs/arceos-hv-task-structure.jpg "Arceos-HV axtask 统一管理")
+![Arceos-HV axtask task_entry](imgs/arceos-hv-task-design.jpg "Arceos-HV axtask task_entry")
 
-`task_entry` 函数修改如下：
+
+`task_entry` 函数具体修改如下：
 
 ```(Rust)
 extern "C" fn task_entry() -> ! {
@@ -168,6 +169,8 @@ extern "C" fn task_entry() -> ! {
     }
 }
 ```
+
+![Arceos-HV axtask 统一管理](imgs/arceos-hv-task-structure.jpg "Arceos-HV axtask 统一管理")
 
 axproccess、axvm 与 axtask 模块的依赖关系为：
 
@@ -210,6 +213,23 @@ arceos-hv 中 axprocess 的系统调用转发需要 Linux 内部的内核态驱�
 内核态驱动主要负责为用户提供一个虚拟设备（`/dev/arceos vdev`），并实现设备相关方法（`mmap`等），为用户态守护进程建立用户虚拟地址空间到对应的共享内存空间（以一个设备内存的形式提供给Linux）的映射。同时，内核态驱动需要注册相关的中断处理函数，用于接收来自其他核心的IPI（告知有一个新的 syscall req），并通过 signal 机制告知用户态守护进程。
 
 用户态守护进程需要 open 内核态驱动提供的虚拟设备，通过 `mmap` 方法主动建立相关的内存映射，并注册一个 `singal_handler`, 接收来自内核态驱动的 singal 主动从 `SyscallQueueBuffer` 中 poll 一个 sycall req 并通过 Linux 下的系统调用完成 syscall 处理，再将结果通过 `SyscallQueueBuffer` 写回。
+
+### scf 整体流程
+
+1. arceos-hv 启动
+2. core 0 enable VMX 支持并配置 Linux 虚拟机执行环境，进入 Linux
+3. core 1 启动 axprocess，首先初始化 `SyscallDataBuffer` 与 `SyscallQueueBuffer`
+4. core 1 axprocess 初始化地址空间与异常上下文(`TrapFrame`)，解析用户 ELF 并建立相关内存映射，拷贝 load 段
+5. core 1 axprocess 进入 task_entry 函数后不立即执行，将自己 blocked 住，等待 Linux 内的 driver 以及 user daemon app 完成初始化
+6. core 0 初始化（加载）内核驱动，运行用户态守护进程，建立与共享内存空间的映射，验证 `SyscallDataBuffer` 与 `SyscallQueueBuffer` 的完备
+7. core 0 完成 arceos-hv-driver 的初始化后，通过 hvc 来 notify 被 blocked 的 axprocess，进入用户态代码
+8. core 1 arceos 异常处理函数收到来自用户态的系统调用请求后，进入 axprocess 的 `syscall_handler` 判断当前系统调用是否需要被转发（syscall route）
+9. core 1 调用 axprocess 的 scf 模块封装并转发 syscall req，通过一个 IPI 告知 Linux 的 arceos-hv-driver 有一个新的syscall 请求
+10. core 1 Linux 的 arceos-hv-driver 内核模块驱动通过 signal 机制告知用户态守护进程从共享内存中的循环队列解析系统调用请求并执行，再将结果写入队列
+
+其中：
+* 步骤5的 axprocess 阻塞操作在 HV1.5 启动模式支持之后可以被去掉（此时先启动Linux）
+* 步骤9的 IPI 机制目前由于 arceos-hv 对 apic 的支持尚未完善，目前 Linux 侧的 arceos-hv-driver 主要通过轮询来poll来自axprocess的syscall请求
 
 
 ## 下一步工作计划
